@@ -1,0 +1,424 @@
+from pathlib import Path
+import json
+import uuid
+import shutil
+import fitz
+
+from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+from app.pdf_document_service import extract_digital_pdf_text
+from app.gemini_service import analyze_document
+
+router = APIRouter(prefix="/api/v1/pdf-documents", tags=["PDF Documents"])
+
+BASE_DIR = Path("storage/pdf-documents")
+UPLOAD_DIR = BASE_DIR / "uploads"
+TEXT_DIR = BASE_DIR / "extracted"
+ANALYSIS_DIR = BASE_DIR / "analysis"
+EDITED_DIR = BASE_DIR / "edited"
+GENERATED_DIR = BASE_DIR / "generated"
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+TEXT_DIR.mkdir(parents=True, exist_ok=True)
+ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
+EDITED_DIR.mkdir(parents=True, exist_ok=True)
+GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+
+
+
+
+class EditedField(BaseModel):
+    name: str = Field(..., min_length=1, max_length=500)
+    field_type: str = Field(default="string", max_length=100)
+    value: str = Field(default="", max_length=10000)
+
+
+class SaveEditedFieldsRequest(BaseModel):
+    fields: list[EditedField] = Field(..., max_length=500)
+
+
+def _validate_document_id(document_id: str):
+    if not document_id or not all(c in "0123456789abcdef" for c in document_id.lower()):
+        raise HTTPException(status_code=400, detail="Invalid PDF document ID.")
+    text_path = (TEXT_DIR / f"{document_id}.txt").resolve()
+    try:
+        text_path.relative_to(TEXT_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid PDF document path.")
+    if not text_path.exists() or not text_path.is_file():
+        raise HTTPException(status_code=404, detail="PDF document not found. Upload it first.")
+    return text_path
+
+
+
+@router.post("/upload")
+async def upload_pdf_document(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a PDF file.")
+
+    document_id = uuid.uuid4().hex
+    safe_filename = Path(file.filename).name
+    original_path = UPLOAD_DIR / f"{document_id}_{safe_filename}"
+
+    try:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="The uploaded PDF is empty.")
+        if not content.startswith(b"%PDF"):
+            raise HTTPException(status_code=400, detail="The uploaded file is not a valid PDF.")
+        original_path.write_bytes(content)
+
+        try:
+            extracted = extract_digital_pdf_text(str(original_path))
+        except ValueError as exc:
+            original_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:
+            original_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"Unable to read PDF: {exc}")
+
+        text_path = TEXT_DIR / f"{document_id}.txt"
+        text_path.write_text(extracted["text"], encoding="utf-8")
+
+        return {
+            "message": "Digital PDF uploaded and text extracted successfully.",
+            "document_id": document_id,
+            "filename": safe_filename,
+            "page_count": extracted["page_count"],
+            "character_count": extracted["character_count"],
+            "extracted_text": extracted["text"],
+            "analysis_status": "PENDING"
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        original_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"PDF upload failed: {exc}")
+
+
+@router.post("/{document_id}/analyze")
+def analyze_pdf_document(document_id: str):
+    # Validate the ID before using it in a filesystem path.
+    if not document_id or not all(c in "0123456789abcdef" for c in document_id.lower()):
+        raise HTTPException(status_code=400, detail="Invalid PDF document ID.")
+
+    text_path = (TEXT_DIR / f"{document_id}.txt").resolve()
+    text_dir_resolved = TEXT_DIR.resolve()
+
+    try:
+        text_path.relative_to(text_dir_resolved)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid PDF document path.")
+
+    if not text_path.exists() or not text_path.is_file():
+        raise HTTPException(status_code=404, detail="Extracted PDF text not found. Upload the PDF first.")
+
+    document_text = text_path.read_text(encoding="utf-8")
+    if not document_text.strip():
+        raise HTTPException(status_code=422, detail="The PDF contains no extractable text.")
+
+    try:
+        analysis = analyze_document(document_text)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"PDF AI analysis failed: {exc}")
+
+    analysis_path = ANALYSIS_DIR / f"{document_id}.json"
+    analysis_path.write_text(
+        json.dumps(analysis.model_dump(mode="json"), indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+    return {
+        "message": "PDF analyzed successfully.",
+        "document_id": document_id,
+        "analysis_status": "COMPLETED",
+        "analysis": analysis
+    }
+
+
+
+
+def _get_original_pdf_path(document_id: str) -> Path:
+    _validate_document_id(document_id)
+    candidates = list(UPLOAD_DIR.glob(f"{document_id}_*.pdf"))
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Original PDF file not found.")
+    return candidates[0]
+
+
+def _find_label_rect(page, field_name: str):
+    """Find a likely label rectangle using exact label text variants."""
+    label = field_name.strip().rstrip(":")
+    if not label:
+        return None
+    for candidate in (label, f"{label}:"):
+        hits = page.search_for(candidate, quads=False)
+        if hits:
+            return hits[0]
+    return None
+
+
+def _collect_blank_targets(page, label_rect):
+    """Return a safe target region for a blank field, based on nearby drawn lines/boxes."""
+    if label_rect is None:
+        return None
+    drawings = page.get_drawings()
+    candidates = []
+    lx0, ly0, lx1, ly1 = label_rect
+
+    # Horizontal lines: same-row line to the right of the label, or a line
+    # immediately below the label (for stacked form layouts).
+    for drawing in drawings:
+        for item in drawing.get("items", []):
+            if item[0] == "l":
+                p1, p2 = item[1], item[2]
+                if abs(p1.y - p2.y) > 2.0:
+                    continue
+                x0, x1 = min(p1.x, p2.x), max(p1.x, p2.x)
+                y = (p1.y + p2.y) / 2.0
+                # Same line: starts after label and is close to label baseline.
+                if x0 >= lx1 - 1 and ly0 - 5 <= y <= ly1 + 8 and x1 - x0 >= 30:
+                    candidates.append((0, abs(y - ly1), fitz.Rect(x0 + 2, y - 17, x1 - 2, y - 3), "same-line"))
+                # Below label: line is below, and starts at/near label's left edge.
+                elif y > ly1 + 2 and y <= ly1 + 65 and x0 <= lx0 + 12 and x1 - x0 >= 30:
+                    candidates.append((1, y - ly1, fitz.Rect(x0 + 2, y - 17, x1 - 2, y - 3), "below-label"))
+            elif item[0] == "re":
+                rect = fitz.Rect(item[1])
+                # Empty box near/under the label.
+                if rect.width >= 30 and rect.height >= 10 and rect.height <= 100:
+                    if rect.x0 >= lx1 - 1 and ly0 - 5 <= rect.y0 <= ly1 + 65:
+                        candidates.append((0, abs(rect.y0 - ly1), fitz.Rect(rect.x0 + 3, rect.y0 + 2, rect.x1 - 3, rect.y1 - 2), "box"))
+                    elif rect.y0 > ly1 and rect.y0 <= ly1 + 65 and rect.x0 <= lx0 + 12:
+                        candidates.append((1, rect.y0 - ly1, fitz.Rect(rect.x0 + 3, rect.y0 + 2, rect.x1 - 3, rect.y1 - 2), "box-below"))
+
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    for _, _, rect, placement in candidates:
+        if rect.width > 15 and rect.height > 5:
+            return {"rect": rect, "placement": placement}
+    return None
+
+
+
+def _insert_text_in_rect(page, rect, value, max_font=12, placement="line"):
+    box = fitz.Rect(rect)
+    value = str(value or "").strip()
+
+    if not value or box.width <= 0 or box.height <= 0:
+        return False, None
+
+    # Boxes: vertically fit the text inside the rectangle.
+    if placement == "box":
+        font_size = min(max_font, box.height * 0.65)
+
+        while font_size >= 6:
+            spare = page.insert_textbox(
+                box,
+                value,
+                fontsize=font_size,
+                fontname="helv",
+                color=(0, 0, 0),
+                align=0,
+            )
+            if spare >= 0:
+                return True, font_size
+            font_size -= 0.5
+
+        return False, None
+
+    # Horizontal lines: position text using its baseline.
+    font_size = max_font
+
+    while font_size >= 6:
+        text_width = fitz.get_text_length(
+            value,
+            fontname="helv",
+            fontsize=font_size
+        )
+
+        if text_width <= box.width:
+            # The bottom of the target rectangle is close to the underline.
+            # Insert using a baseline rather than a textbox.
+            baseline = box.y1
+
+            page.insert_text(
+                (box.x0, baseline),
+                value,
+                fontsize=font_size,
+                fontname="helv",
+                color=(0, 0, 0),
+            )
+
+            return True, font_size
+
+        font_size -= 0.5
+
+    return False, None
+
+@router.post("/{document_id}/generate")
+def generate_edited_pdf(document_id: str):
+    """Generate edited PDF: replace existing text and fill detected blank lines/boxes."""
+    original_path = _get_original_pdf_path(document_id)
+    analysis_path = ANALYSIS_DIR / f"{document_id}.json"
+    edited_path = EDITED_DIR / f"{document_id}.json"
+    if not analysis_path.exists():
+        raise HTTPException(status_code=404, detail="AI analysis not found. Analyze the PDF first.")
+    if not edited_path.exists():
+        raise HTTPException(status_code=404, detail="Edited fields not found. Save edits first.")
+    try:
+        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+        edited = json.loads(edited_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Saved analysis or edits could not be read.")
+
+    old_fields = analysis.get("fields", [])
+    new_fields = edited.get("fields", [])
+    old_by_name = {str(f.get("name", "")).strip().casefold(): f for f in old_fields if isinstance(f, dict)}
+    changes, blank_fields, unmatched = [], [], []
+    for field in new_fields:
+        if not isinstance(field, dict):
+            continue
+        name = str(field.get("name", "")).strip()
+        source = old_by_name.get(name.casefold())
+        new_value = str(field.get("value", "") or "").strip()
+        if not new_value:
+            continue
+        old_value = str(source.get("value", "") or "").strip() if source else ""
+        if source and old_value and old_value != new_value:
+            changes.append({"field": name, "old": old_value, "new": new_value})
+        else:
+            blank_fields.append({"field": name, "value": new_value})
+
+    generated_path = GENERATED_DIR / f"{document_id}_edited.pdf"
+    try:
+        doc = fitz.open(original_path)
+        # Existing text replacements: locate and redact before insertion.
+        replacement_hits = {}
+        for change in changes:
+            hits = []
+            for page_index, page in enumerate(doc):
+                hits.extend((page_index, rect) for rect in page.search_for(change["old"]))
+            change["hits"] = hits
+            if not hits:
+                unmatched.append({"field": change["field"], "reason": "Source text not found in PDF."})
+            for page_index, rect in hits:
+                replacement_hits.setdefault(page_index, []).append((rect, change))
+        for page_index, items in replacement_hits.items():
+            page = doc[page_index]
+            for rect, change in items:
+                page.add_redact_annot(rect, fill=(1, 1, 1))
+            page.apply_redactions()
+            for rect, change in items:
+                box = fitz.Rect(rect)
+                box.x0 += 0.5; box.x1 -= 0.5; box.y0 += 0.2; box.y1 -= 0.2
+                ok, fs = _insert_text_in_rect(page, box, change["new"], max_font=11)
+                if ok:
+                    change["inserted_count"] = change.get("inserted_count", 0) + 1
+                else:
+                    unmatched.append({"field": change["field"], "reason": "Replacement text did not fit the source text area."})
+
+        # Blank fields: detect labels and nearby line/box geometry. Avoid guessing
+        # when there is no reliable geometric target.
+        blank_applied = []
+        for item in blank_fields:
+            name, value = item["field"], item["value"]
+            placement_found = False
+            for page_index, page in enumerate(doc):
+                label_rect = _find_label_rect(page, name)
+                target = _collect_blank_targets(page, label_rect)
+                if not target:
+                    continue
+                ok, fs = _insert_text_in_rect(
+                    page,
+                    target["rect"],
+                    value,
+                    max_font=12,
+                    placement=target["placement"]
+                )
+                if ok:
+                    blank_applied.append({"field": name, "value": value, "page": page_index + 1,
+                                        "placement": target["placement"], "font_size": fs})
+                    placement_found = True
+                    break
+            if not placement_found:
+                unmatched.append({"field": name, "reason": "No clear blank line or box found near the label; not placed to avoid guessing."})
+
+        doc.save(generated_path, garbage=4, deflate=True)
+        doc.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}")
+
+    applied = [{"field": ch["field"], "old_value": ch["old"], "new_value": ch["new"],
+                "matches": len(ch.get("hits", [])), "inserted": ch.get("inserted_count", 0)} for ch in changes]
+    return {"message": "Generated PDF created.", "document_id": document_id,
+            "generated_filename": generated_path.name,
+            "download_url": f"/api/v1/pdf-documents/{document_id}/generated",
+            "applied_changes": applied, "blank_fields_filled": blank_applied,
+            "unmatched_fields": unmatched}
+
+
+@router.get("/{document_id}/generated")
+def download_generated_pdf(document_id: str):
+    _validate_document_id(document_id)
+    generated_path = (GENERATED_DIR / f"{document_id}_edited.pdf").resolve()
+    try:
+        generated_path.relative_to(GENERATED_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid generated PDF path.")
+    if not generated_path.exists():
+        raise HTTPException(status_code=404, detail="Generated PDF not found. Generate it first.")
+    return FileResponse(str(generated_path), media_type="application/pdf", filename=generated_path.name)
+@router.get("/{document_id}/generated")
+def download_generated_pdf(document_id: str):
+    _validate_document_id(document_id)
+    generated_path = (GENERATED_DIR / f"{document_id}_edited.pdf").resolve()
+    try:
+        generated_path.relative_to(GENERATED_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid generated PDF path.")
+    if not generated_path.exists():
+        raise HTTPException(status_code=404, detail="Generated PDF not found. Generate it first.")
+    return FileResponse(str(generated_path), media_type="application/pdf", filename=generated_path.name)
+
+
+@router.put("/{document_id}/edited")
+def save_edited_pdf_fields(document_id: str, request: SaveEditedFieldsRequest):
+    _validate_document_id(document_id)
+    edited_path = (EDITED_DIR / f"{document_id}.json").resolve()
+    try:
+        edited_path.relative_to(EDITED_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid edited data path.")
+
+    payload = {
+        "document_id": document_id,
+        "fields": [field.model_dump() for field in request.fields],
+    }
+    edited_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {
+        "message": "Edited PDF fields saved successfully.",
+        "document_id": document_id,
+        "field_count": len(request.fields),
+        "fields": payload["fields"],
+    }
+
+
+@router.get("/{document_id}/edited")
+def get_edited_pdf_fields(document_id: str):
+    _validate_document_id(document_id)
+    edited_path = (EDITED_DIR / f"{document_id}.json").resolve()
+    try:
+        edited_path.relative_to(EDITED_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid edited data path.")
+
+    if not edited_path.exists() or not edited_path.is_file():
+        raise HTTPException(status_code=404, detail="No saved edits found for this PDF document.")
+
+    try:
+        payload = json.loads(edited_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Saved edited fields could not be read.")
+
+    return payload
