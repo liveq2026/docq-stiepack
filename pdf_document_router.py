@@ -201,6 +201,42 @@ def _collect_blank_targets(page, label_rect):
 
 
 
+
+def _collect_table_cell_target(page, label_rect):
+    """Find the smallest drawn rectangle enclosing a label and return the blank area below it."""
+    if label_rect is None:
+        return None
+    label = fitz.Rect(label_rect)
+    candidates = []
+    for drawing in page.get_drawings():
+        for item in drawing.get("items", []):
+            if item[0] != "re":
+                continue
+            cell = fitz.Rect(item[1])
+            # Require the label to be inside the rectangle with a small tolerance.
+            if (cell.width >= 50 and cell.height >= 24 and
+                cell.x0 <= label.x0 + 1 and cell.x1 >= label.x1 - 1 and
+                cell.y0 <= label.y0 + 2 and cell.y1 >= label.y1 - 2):
+                # Label should be near the top of the cell; otherwise this may be
+                # a larger container or an unrelated enclosing border.
+                if label.y0 - cell.y0 <= cell.height * 0.45:
+                    candidates.append(cell)
+    if not candidates:
+        return None
+    cell = min(candidates, key=lambda r: r.width * r.height)
+    # Interior writing region below the label, with consistent padding.
+    horizontal_padding = 6.5
+    vertical_top_padding = 7.0
+    vertical_bottom_padding = 6.5
+    target = fitz.Rect(cell.x0 + horizontal_padding, label.y1 + vertical_top_padding, cell.x1 - horizontal_padding, label.y1 + vertical_top_padding)
+    target.y1 = cell.y1 - vertical_bottom_padding
+    if target.width < 20 or target.height < 8:
+        return None
+    return {
+        "rect": target,
+        "placement": "table-cell",
+    }
+
 def _insert_text_in_rect(page, rect, value, max_font=12, placement="line"):
     box = fitz.Rect(rect)
     value = str(value or "").strip()
@@ -209,7 +245,7 @@ def _insert_text_in_rect(page, rect, value, max_font=12, placement="line"):
         return False, None
 
     # Boxes: vertically fit the text inside the rectangle.
-    if placement == "box":
+    if placement in ("box", "table-cell"):
         font_size = min(max_font, box.height * 0.65)
 
         while font_size >= 6:
@@ -326,14 +362,18 @@ def generate_edited_pdf(document_id: str):
             placement_found = False
             for page_index, page in enumerate(doc):
                 label_rect = _find_label_rect(page, name)
-                target = _collect_blank_targets(page, label_rect)
+                # Table cells are detected first: a cell rectangle encloses the
+                # label, and its blank interior below the label is the fill region.
+                target = _collect_table_cell_target(page, label_rect)
+                if not target:
+                    target = _collect_blank_targets(page, label_rect)
                 if not target:
                     continue
                 ok, fs = _insert_text_in_rect(
                     page,
                     target["rect"],
                     value,
-                    max_font=12,
+                    max_font=11,
                     placement=target["placement"]
                 )
                 if ok:
@@ -358,17 +398,6 @@ def generate_edited_pdf(document_id: str):
             "unmatched_fields": unmatched}
 
 
-@router.get("/{document_id}/generated")
-def download_generated_pdf(document_id: str):
-    _validate_document_id(document_id)
-    generated_path = (GENERATED_DIR / f"{document_id}_edited.pdf").resolve()
-    try:
-        generated_path.relative_to(GENERATED_DIR.resolve())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid generated PDF path.")
-    if not generated_path.exists():
-        raise HTTPException(status_code=404, detail="Generated PDF not found. Generate it first.")
-    return FileResponse(str(generated_path), media_type="application/pdf", filename=generated_path.name)
 @router.get("/{document_id}/generated")
 def download_generated_pdf(document_id: str):
     _validate_document_id(document_id)
