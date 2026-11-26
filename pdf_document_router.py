@@ -149,31 +149,32 @@ def _get_original_pdf_path(document_id: str) -> Path:
 
 
 def _find_label_rect(page, field_name: str):
-    """Find labels using exact text and German/English aliases, favoring nearby lines."""
+    """Find a PDF label using direct search, aliases, and normalized word matching."""
     import re
     label = str(field_name or "").strip()
     if not label:
         return None
 
     def norm(value):
-        value = value.casefold().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+        value = str(value or "").casefold()
+        value = value.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
         value = re.sub(r"[^a-z0-9]+", " ", value)
         return re.sub(r"\s+", " ", value).strip()
 
-    aliases = [label]
     nlabel = norm(label)
+    aliases = [label]
     if any(term in nlabel for term in ("liefertermin", "delivery date", "delivery time", "expected delivery", "delivery")):
-        aliases.extend(["Liefertermin ca.", "Liefertermin", "Delivery Date", "Expected Delivery", "Delivery Time"])
+        aliases += ["Liefertermin ca.", "Liefertermin", "Delivery Date", "Expected Delivery", "Delivery Time"]
     if "customer number" in nlabel or "kundennummer" in nlabel:
-        aliases.extend(["Kundennummer", "Kunden-Nr", "Customer Number"])
+        aliases += ["Kundennummer", "Kunden-Nr", "Customer Number"]
     if "invoice number" in nlabel or "rechnungsnummer" in nlabel:
-        aliases.extend(["Rechnungsnummer", "Rechnung Nr", "Invoice Number"])
+        aliases += ["Rechnungsnummer", "Rechnung Nr", "Invoice Number"]
     if "contact person" in nlabel or "ansprechpartner" in nlabel:
-        aliases.extend(["Ansprechpartner", "Contact Person"])
+        aliases += ["Ansprechpartner", "Contact Person"]
     if "company" in nlabel or "firma" in nlabel:
-        aliases.extend(["Firma", "Company"])
+        aliases += ["Firma", "Company"]
     if "address" in nlabel or "adresse" in nlabel:
-        aliases.extend(["Adresse", "Address"])
+        aliases += ["Adresse", "Address"]
 
     hits = []
     for alias in aliases:
@@ -183,6 +184,35 @@ def _find_label_rect(page, field_name: str):
         for rect in page.search_for(alias):
             if not any(abs(rect.x0-r.x0) < 1 and abs(rect.y0-r.y0) < 1 for r in hits):
                 hits.append(rect)
+    # Fallback: reconstruct labels from extracted words (handles split spans,
+    # punctuation, and labels such as "Liefertermin ca.:" in form PDFs).
+    target_tokens = norm(label).split()
+    if not hits and target_tokens:
+        words = page.get_text("words") or []
+        lines = {}
+        for w in words:
+            # word tuple: x0,y0,x1,y1,text,block,line,word_no
+            key = (w[5], w[6])
+            lines.setdefault(key, []).append(w)
+        alias_tokens = [norm(a).split() for a in aliases if norm(a)]
+        for line_words in lines.values():
+            line_words.sort(key=lambda w: w[0])
+            for i in range(len(line_words)):
+                for tokens in alias_tokens:
+                    if not tokens or i + len(tokens) > len(line_words):
+                        continue
+                    segment = line_words[i:i+len(tokens)]
+                    if [norm(w[4]) for w in segment] == tokens:
+                        rect = fitz.Rect(min(w[0] for w in segment), min(w[1] for w in segment),
+                                         max(w[2] for w in segment), max(w[3] for w in segment))
+                        hits.append(rect)
+        if hits:
+            # Deduplicate fuzzy reconstructed matches.
+            unique = []
+            for r in hits:
+                if not any(abs(r.x0-u.x0) < 1 and abs(r.y0-u.y0) < 1 for u in unique):
+                    unique.append(r)
+            hits = unique
     if not hits:
         return None
 
@@ -192,21 +222,23 @@ def _find_label_rect(page, field_name: str):
         best = 1e9
         for drawing in drawings:
             for item in drawing.get("items", []):
-                if item[0] != "l":
-                    continue
-                a, b = item[1], item[2]
-                if abs(a.y - b.y) > 2.0:
-                    continue
-                lx0, lx1 = min(a.x, b.x), max(a.x, b.x)
-                ly = (a.y + b.y) / 2.0
-                if lx0 >= x1 - 1 and y0 - 8 <= ly <= y1 + 65 and lx1 - lx0 >= 20:
-                    best = min(best, abs(ly - y1))
+                if item[0] == "l":
+                    a, b = item[1], item[2]
+                    if abs(a.y - b.y) <= 2.0:
+                        lx0, lx1 = min(a.x, b.x), max(a.x, b.x)
+                        ly = (a.y + b.y) / 2.0
+                        if lx0 >= x1 - 1 and y0 - 10 <= ly <= y1 + 40 and lx1 - lx0 >= 20:
+                            best = min(best, abs(ly - y1))
+                elif item[0] == "re":
+                    r = fitz.Rect(item[1])
+                    # An outlined row/field may contain both the label and underline.
+                    if r.x0 <= x0 and r.x1 >= x1 and r.y0 <= y0 and r.y1 >= y1:
+                        best = min(best, 0.5)
         return best
 
     ranked = sorted(hits, key=line_score)
     if line_score(ranked[0]) < 1e8:
         return ranked[0]
-    # Keep ambiguous short labels conservative, but accept distinctive labels.
     return ranked[0] if len(norm(label)) >= 5 else None
 
 
@@ -229,14 +261,14 @@ def _collect_blank_targets(page, label_rect):
                 x0, x1 = min(p1.x, p2.x), max(p1.x, p2.x)
                 y = (p1.y + p2.y) / 2.0
                 # Same line: starts after label and is close to label baseline.
-                if x0 >= lx1 - 1 and ly0 - 8 <= y <= ly1 + 22 and x1 - x0 >= 30:
+                if x0 >= lx1 - 1 and ly0 - 12 <= y <= ly1 + 35 and x1 - x0 >= 18:
                     candidates.append((0, abs(y - ly1), fitz.Rect(x0 + 2, y - 17, x1 - 2, y - 3), "same-line"))
                 # Horizontal writing line may sit slightly below the label baseline
                 # and begin to the right of the label (common in German forms).
-                elif y > ly1 + 2 and y <= ly1 + 65 and x0 >= lx1 - 1 and x1 - x0 >= 30:
+                elif y > ly1 + 2 and y <= ly1 + 75 and x0 >= lx1 - 1 and x1 - x0 >= 18:
                     candidates.append((0, y - ly1, fitz.Rect(x0 + 2, y - 17, x1 - 2, y - 3), "same-line"))
                 # Stacked layout: writing line begins near the label's left edge.
-                elif y > ly1 + 2 and y <= ly1 + 65 and x0 <= lx0 + 12 and x1 - x0 >= 30:
+                elif y > ly1 + 2 and y <= ly1 + 75 and x0 <= lx0 + 12 and x1 - x0 >= 18:
                     candidates.append((1, y - ly1, fitz.Rect(x0 + 2, y - 17, x1 - 2, y - 3), "below-label"))
             elif item[0] == "re":
                 rect = fitz.Rect(item[1])
