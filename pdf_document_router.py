@@ -25,7 +25,7 @@ TEXT_DIR.mkdir(parents=True, exist_ok=True)
 ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 EDITED_DIR.mkdir(parents=True, exist_ok=True)
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-AQ.Ab8RN6KzThB2aayHPDclBD9TMKN6PIs1Tolyq3E5rhlr3GfY
+
 
 
 
@@ -149,23 +149,43 @@ def _get_original_pdf_path(document_id: str) -> Path:
 
 
 def _find_label_rect(page, field_name: str):
-    """Prefer an exact label-with-colon match to avoid matching headings or prose."""
-    label = field_name.strip().rstrip(":")
+    """Find labels using exact text and German/English aliases, favoring nearby lines."""
+    import re
+    label = str(field_name or "").strip()
     if not label:
         return None
 
-    # Exact punctuation-bearing label is the safest anchor (e.g. "Age:").
-    exact_hits = page.search_for(f"{label}:", quads=False)
-    if exact_hits:
-        return exact_hits[0]
+    def norm(value):
+        value = value.casefold().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+        value = re.sub(r"[^a-z0-9]+", " ", value)
+        return re.sub(r"\s+", " ", value).strip()
 
-    # Fall back to the bare label only when no colon-form label exists.
-    hits = page.search_for(label, quads=False)
+    aliases = [label]
+    nlabel = norm(label)
+    if any(term in nlabel for term in ("liefertermin", "delivery date", "delivery time", "expected delivery", "delivery")):
+        aliases.extend(["Liefertermin ca.", "Liefertermin", "Delivery Date", "Expected Delivery", "Delivery Time"])
+    if "customer number" in nlabel or "kundennummer" in nlabel:
+        aliases.extend(["Kundennummer", "Kunden-Nr", "Customer Number"])
+    if "invoice number" in nlabel or "rechnungsnummer" in nlabel:
+        aliases.extend(["Rechnungsnummer", "Rechnung Nr", "Invoice Number"])
+    if "contact person" in nlabel or "ansprechpartner" in nlabel:
+        aliases.extend(["Ansprechpartner", "Contact Person"])
+    if "company" in nlabel or "firma" in nlabel:
+        aliases.extend(["Firma", "Company"])
+    if "address" in nlabel or "adresse" in nlabel:
+        aliases.extend(["Adresse", "Address"])
+
+    hits = []
+    for alias in aliases:
+        alias = alias.strip().rstrip(":")
+        if not alias:
+            continue
+        for rect in page.search_for(alias):
+            if not any(abs(rect.x0-r.x0) < 1 and abs(rect.y0-r.y0) < 1 for r in hits):
+                hits.append(rect)
     if not hits:
         return None
 
-    # If there are several hits (common for short names such as Age), prefer
-    # one whose right side has a nearby horizontal line, rather than a heading.
     drawings = page.get_drawings()
     def line_score(rect):
         x0, y0, x1, y1 = rect
@@ -179,14 +199,15 @@ def _find_label_rect(page, field_name: str):
                     continue
                 lx0, lx1 = min(a.x, b.x), max(a.x, b.x)
                 ly = (a.y + b.y) / 2.0
-                if lx0 >= x1 - 1 and y0 - 5 <= ly <= y1 + 12 and lx1 - lx0 >= 30:
+                if lx0 >= x1 - 1 and y0 - 8 <= ly <= y1 + 65 and lx1 - lx0 >= 20:
                     best = min(best, abs(ly - y1))
         return best
+
     ranked = sorted(hits, key=line_score)
-    # Do not use a short/ambiguous bare-word hit unless it has a nearby line.
-    if line_score(ranked[0]) >= 1e8:
-        return None
-    return ranked[0]
+    if line_score(ranked[0]) < 1e8:
+        return ranked[0]
+    # Keep ambiguous short labels conservative, but accept distinctive labels.
+    return ranked[0] if len(norm(label)) >= 5 else None
 
 
 def _collect_blank_targets(page, label_rect):
