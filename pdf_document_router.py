@@ -149,62 +149,44 @@ def _get_original_pdf_path(document_id: str) -> Path:
 
 
 def _find_label_rect(page, field_name: str):
-    """Find a likely label rectangle using exact label text variants."""
+    """Prefer an exact label-with-colon match to avoid matching headings or prose."""
     label = field_name.strip().rstrip(":")
     if not label:
         return None
-    for candidate in (label, f"{label}:"):
-        hits = page.search_for(candidate, quads=False)
-        if hits:
-            return hits[0]
-    return None
 
+    # Exact punctuation-bearing label is the safest anchor (e.g. "Age:").
+    exact_hits = page.search_for(f"{label}:", quads=False)
+    if exact_hits:
+        return exact_hits[0]
 
-def _collect_underscore_target(page, label_rect):
-    """Find text-based underscore placeholders near a label using PDF character boxes."""
-    if label_rect is None:
+    # Fall back to the bare label only when no colon-form label exists.
+    hits = page.search_for(label, quads=False)
+    if not hits:
         return None
-    label = fitz.Rect(label_rect)
-    candidates = []
-    raw = page.get_text("rawdict")
-    for block in raw.get("blocks", []):
-        for line in block.get("lines", []):
-            chars = []
-            for span in line.get("spans", []):
-                chars.extend(span.get("chars", []))
-            i = 0
-            while i < len(chars):
-                if chars[i].get("c") != "_":
-                    i += 1
+
+    # If there are several hits (common for short names such as Age), prefer
+    # one whose right side has a nearby horizontal line, rather than a heading.
+    drawings = page.get_drawings()
+    def line_score(rect):
+        x0, y0, x1, y1 = rect
+        best = 1e9
+        for drawing in drawings:
+            for item in drawing.get("items", []):
+                if item[0] != "l":
                     continue
-                j = i
-                while j < len(chars) and chars[j].get("c") == "_":
-                    j += 1
-                if j - i >= 3:
-                    rects = [fitz.Rect(ch["bbox"]) for ch in chars[i:j] if ch.get("bbox")]
-                    if rects:
-                        run = rects[0]
-                        for r in rects[1:]:
-                            run |= r
-                        # Prefer placeholders on the label's line and to its right.
-                        same_line = (run.x0 >= label.x1 - 1 and
-                                     run.y0 <= label.y1 + 5 and run.y1 >= label.y0 - 5)
-                        below_label = (run.y0 > label.y1 + 1 and run.y0 <= label.y1 + 65 and
-                                      run.x0 <= label.x0 + 18)
-                        if same_line:
-                            candidates.append((0, abs(run.y0 - label.y0), run))
-                        elif below_label:
-                            candidates.append((1, run.y0 - label.y1, run))
-                i = max(j, i + 1)
-    if not candidates:
+                a, b = item[1], item[2]
+                if abs(a.y - b.y) > 2.0:
+                    continue
+                lx0, lx1 = min(a.x, b.x), max(a.x, b.x)
+                ly = (a.y + b.y) / 2.0
+                if lx0 >= x1 - 1 and y0 - 5 <= ly <= y1 + 12 and lx1 - lx0 >= 30:
+                    best = min(best, abs(ly - y1))
+        return best
+    ranked = sorted(hits, key=line_score)
+    # Do not use a short/ambiguous bare-word hit unless it has a nearby line.
+    if line_score(ranked[0]) >= 1e8:
         return None
-    candidates.sort(key=lambda item: (item[0], item[1]))
-    run = candidates[0][2]
-    # A small vertical margin is included for redaction; baseline stays at the
-    # bottom of the underscore glyphs for natural same-line replacement.
-    redact_rect = fitz.Rect(run.x0 - 1, run.y0 - 1, run.x1 + 1, run.y1 + 1)
-    insert_rect = fitz.Rect(run.x0, run.y0 - 1, run.x1, run.y1 + 2)
-    return {"rect": insert_rect, "redact_rect": redact_rect, "placement": "underscore"}
+    return ranked[0]
 
 
 def _collect_blank_targets(page, label_rect):
@@ -226,9 +208,13 @@ def _collect_blank_targets(page, label_rect):
                 x0, x1 = min(p1.x, p2.x), max(p1.x, p2.x)
                 y = (p1.y + p2.y) / 2.0
                 # Same line: starts after label and is close to label baseline.
-                if x0 >= lx1 - 1 and ly0 - 5 <= y <= ly1 + 8 and x1 - x0 >= 30:
+                if x0 >= lx1 - 1 and ly0 - 8 <= y <= ly1 + 22 and x1 - x0 >= 30:
                     candidates.append((0, abs(y - ly1), fitz.Rect(x0 + 2, y - 17, x1 - 2, y - 3), "same-line"))
-                # Below label: line is below, and starts at/near label's left edge.
+                # Horizontal writing line may sit slightly below the label baseline
+                # and begin to the right of the label (common in German forms).
+                elif y > ly1 + 2 and y <= ly1 + 65 and x0 >= lx1 - 1 and x1 - x0 >= 30:
+                    candidates.append((0, y - ly1, fitz.Rect(x0 + 2, y - 17, x1 - 2, y - 3), "same-line"))
+                # Stacked layout: writing line begins near the label's left edge.
                 elif y > ly1 + 2 and y <= ly1 + 65 and x0 <= lx0 + 12 and x1 - x0 >= 30:
                     candidates.append((1, y - ly1, fitz.Rect(x0 + 2, y - 17, x1 - 2, y - 3), "below-label"))
             elif item[0] == "re":
@@ -248,6 +234,77 @@ def _collect_blank_targets(page, label_rect):
 
 
 
+
+
+def _collect_underscore_target(page, label_rect, field_name):
+    """Find a text underscore placeholder associated with a field label."""
+    if label_rect is None:
+        return None
+    label = fitz.Rect(label_rect)
+    candidates = []
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                if "_" not in text:
+                    continue
+                # Only treat long underscore runs as blank placeholders.
+                import re
+                for match in re.finditer(r"_{4,}", text):
+                    bbox = fitz.Rect(span["bbox"])
+                    run_text = match.group(0)
+                    prefix = text[:match.start()]
+                    suffix = text[match.end():]
+                    size = float(span.get("size", 11))
+                    font = span.get("font", "Helvetica")
+                    # For standard fonts, use font metrics to calculate the run's
+                    # x-position. For unknown fonts, use proportional span width.
+                    try:
+                        x0 = bbox.x0 + fitz.get_text_length(prefix, fontname=font, fontsize=size)
+                        run_width = fitz.get_text_length(run_text, fontname=font, fontsize=size)
+                    except Exception:
+                        total_chars = max(1, len(text))
+                        x0 = bbox.x0 + bbox.width * (match.start() / total_chars)
+                        run_width = bbox.width * (len(run_text) / total_chars)
+                    run_rect = fitz.Rect(x0, bbox.y0, x0 + run_width, bbox.y1)
+                    # Same row, to the right of the label; or a blank directly
+                    # beneath the label. Also allow label and underscores in one span.
+                    same_row = (run_rect.x0 >= label.x1 - 1 and
+                                label.y0 - 5 <= run_rect.y0 <= label.y1 + 8)
+                    below_label = (run_rect.y0 > label.y1 + 2 and
+                               run_rect.y0 <= label.y1 + 65 and
+                               run_rect.x0 <= label.x0 + 12)
+                    combined_span = field_name.lower() in text.lower()
+                    if same_row or below_label or combined_span:
+                        candidates.append((0 if same_row or combined_span else 1,
+                                          abs(run_rect.y0 - label.y0), run_rect))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return {"rect": candidates[0][2], "placement": "underscore"}
+
+
+def _fill_underscore_target(page, rect, value, max_font=11):
+    """Remove underscore text, restore a clean underline, and place value above it."""
+    box = fitz.Rect(rect)
+    value = str(value or "").strip()
+    if not value or box.width < 15 or box.height < 5:
+        return False, None
+    # Redact only the placeholder characters, leaving the label untouched.
+    page.add_redact_annot(box, fill=(1, 1, 1))
+    page.apply_redactions()
+    line_y = box.y1 - 3.0
+    page.draw_line(fitz.Point(box.x0, line_y), fitz.Point(box.x1, line_y),
+                   color=(0, 0, 0), width=0.55)
+    font_size = max_font
+    while font_size >= 6:
+        width = fitz.get_text_length(value, fontname="helv", fontsize=font_size)
+        if width <= box.width:
+            page.insert_text((box.x0, line_y - 2.0), value, fontsize=font_size,
+                            fontname="helv", color=(0, 0, 0))
+            return True, font_size
+        font_size -= 0.5
+    return False, None
 
 def _collect_table_cell_target(page, label_rect):
     """Find the smallest drawn rectangle enclosing a label and return the blank area below it."""
@@ -406,36 +463,30 @@ def generate_edited_pdf(document_id: str):
         blank_applied = []
         for item in blank_fields:
             name, value = item["field"], item["value"]
-            placement_found = False
+            placements_count = 0
             for page_index, page in enumerate(doc):
                 label_rect = _find_label_rect(page, name)
-                # Table cells are detected first: a cell rectangle encloses the
-                # label, and its blank interior below the label is the fill region.
-                # Text-based underscores are not drawing objects; detect them from
-                # character-level PDF text geometry and replace the placeholder.
-                target = _collect_underscore_target(page, label_rect)
-                if target and target.get("redact_rect"):
-                    page.add_redact_annot(target["redact_rect"], fill=(1, 1, 1))
-                    page.apply_redactions()
-                if not target:
+                # Text underscores are checked first because they are not drawing
+                # objects and therefore cannot be found by line/rectangle geometry.
+                target = _collect_underscore_target(page, label_rect, name)
+                if target:
+                    ok, fs = _fill_underscore_target(page, target["rect"], value, max_font=11)
+                else:
+                    # Keep existing table-cell, drawn-line, and box behavior.
                     target = _collect_table_cell_target(page, label_rect)
-                if not target:
-                    target = _collect_blank_targets(page, label_rect)
-                if not target:
-                    continue
-                ok, fs = _insert_text_in_rect(
-                    page,
-                    target["rect"],
-                    value,
-                    max_font=11,
-                    placement="line" if target["placement"] == "underscore" else target["placement"]
-                )
+                    if not target:
+                        target = _collect_blank_targets(page, label_rect)
+                    if not target:
+                        continue
+                    ok, fs = _insert_text_in_rect(
+                        page, target["rect"], value, max_font=11,
+                        placement=target["placement"]
+                    )
                 if ok:
                     blank_applied.append({"field": name, "value": value, "page": page_index + 1,
                                         "placement": target["placement"], "font_size": fs})
-                    placement_found = True
-                    break
-            if not placement_found:
+                    placements_count += 1
+            if placements_count == 0:
                 unmatched.append({"field": name, "reason": "No clear blank line or box found near the label; not placed to avoid guessing."})
 
         doc.save(generated_path, garbage=4, deflate=True)
